@@ -315,6 +315,12 @@ public class DevOpsOrchestrator
 
             if (response?.Value == null) return results;
 
+            // DEBUG: Log the raw response to understand the structure
+            var rawJson = await _httpClient.GetStringAsync(url);
+            AnsiConsole.MarkupLine($"[grey]DEBUG: Raw API Response:[/]");
+            AnsiConsole.MarkupLine($"[grey]{rawJson[..Math.Min(2000, rawJson.Length)]}[/]");
+            AnsiConsole.WriteLine();
+
             foreach (var approval in response.Value)
             {
                 // Check if current user is assigned to this approval
