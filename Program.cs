@@ -235,9 +235,10 @@ public class DevOpsOrchestrator
     private readonly HttpClient _httpClient;
     private readonly AppSettings _settings;
     private readonly string _baseUrl;
-    private string _currentUserId = string.Empty;
+    private string _currentUserDisplayName = string.Empty;
+    private string _currentUserEmailPrefix = string.Empty;
 
-    public bool HasValidUserId => !string.IsNullOrEmpty(_currentUserId);
+    public bool HasValidUser => !string.IsNullOrEmpty(_currentUserEmailPrefix);
 
     public DevOpsOrchestrator(HttpClient httpClient, AppSettings settings)
     {
@@ -259,22 +260,30 @@ public class DevOpsOrchestrator
                 var profileJson = await profileResponse.Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(profileJson);
 
-                if (doc.RootElement.TryGetProperty("id", out var idProp))
-                {
-                    _currentUserId = idProp.GetString() ?? string.Empty;
-                }
-
                 if (doc.RootElement.TryGetProperty("displayName", out var nameProp))
                 {
-                    return nameProp.GetString() ?? "Unknown User";
+                    _currentUserDisplayName = nameProp.GetString() ?? string.Empty;
+                }
+
+                // Extract email prefix for matching (more reliable than display name)
+                if (doc.RootElement.TryGetProperty("emailAddress", out var emailProp))
+                {
+                    var email = emailProp.GetString() ?? string.Empty;
+                    _currentUserEmailPrefix = GetEmailPrefix(email);
+                }
+
+                if (!string.IsNullOrEmpty(_currentUserDisplayName))
+                {
+                    return _currentUserDisplayName;
                 }
             }
 
             // Fallback to connectionData API if profile API fails
             var url = $"{_settings.OrganizationUrl.TrimEnd('/')}/_apis/connectionData?api-version=7.1";
             var response = await _httpClient.GetFromJsonAsync<ConnectionDataResponse>(url);
-            _currentUserId = response?.AuthenticatedUser?.Id ?? string.Empty;
-            return response?.AuthenticatedUser?.DisplayName ?? "Unknown User";
+            _currentUserDisplayName = response?.AuthenticatedUser?.DisplayName ?? string.Empty;
+            _currentUserEmailPrefix = GetEmailPrefix(response?.AuthenticatedUser?.UniqueName ?? string.Empty);
+            return _currentUserDisplayName.Length > 0 ? _currentUserDisplayName : "Unknown User";
         }
         catch (HttpRequestException ex)
         {
@@ -288,13 +297,20 @@ public class DevOpsOrchestrator
         }
     }
 
+    private static string GetEmailPrefix(string email)
+    {
+        if (string.IsNullOrEmpty(email)) return string.Empty;
+        var atIndex = email.IndexOf('@');
+        return atIndex > 0 ? email[..atIndex] : email;
+    }
+
     public async Task<List<ApprovalDisplayItem>> GetPendingApprovalsForStageAsync(string stageName)
     {
         var results = new List<ApprovalDisplayItem>();
 
         try
         {
-            var url = $"{_baseUrl}/pipelines/approvals?api-version=7.1&state=pending";
+            var url = $"{_baseUrl}/pipelines/approvals?api-version=7.1&state=pending&$expand=steps";
             var response = await _httpClient.GetFromJsonAsync<ApprovalsResponse>(url);
 
             if (response?.Value == null) return results;
@@ -302,10 +318,11 @@ public class DevOpsOrchestrator
             foreach (var approval in response.Value)
             {
                 // Check if current user is assigned to this approval
-                // If _currentUserId is empty (API failed), show all pending approvals with a warning
+                // Match by email prefix since IDs and full emails may differ across systems
                 bool isAssigned;
-                if (string.IsNullOrEmpty(_currentUserId))
+                if (string.IsNullOrEmpty(_currentUserEmailPrefix))
                 {
+                    // If we couldn't get the user info, show all pending approvals
                     isAssigned = approval.Steps?.Any(s =>
                         s.Status.Equals("pending", StringComparison.OrdinalIgnoreCase)) ?? false;
                 }
@@ -313,7 +330,7 @@ public class DevOpsOrchestrator
                 {
                     isAssigned = approval.Steps?.Any(s =>
                         s.Status.Equals("pending", StringComparison.OrdinalIgnoreCase) &&
-                        s.AssignedApprover?.Id == _currentUserId) ?? false;
+                        string.Equals(GetEmailPrefix(s.AssignedApprover?.UniqueName ?? ""), _currentUserEmailPrefix, StringComparison.OrdinalIgnoreCase)) ?? false;
                 }
 
                 if (!isAssigned) continue;
@@ -546,6 +563,10 @@ public static class Program
 
         DisplayConfigurationSummary(settings);
 
+        // Prompt user before launching browser for authentication
+        AnsiConsole.MarkupLine("[yellow]Authentication required.[/] Press [green]Enter[/] to open browser and sign in with Azure AD...");
+        Console.ReadLine();
+
         // Step 2: Authenticate
         TokenCredential? credential = null;
         HttpClient? httpClient = null;
@@ -580,9 +601,9 @@ public static class Program
                 });
 
             AnsiConsole.MarkupLine($"[green]✓[/] Authenticated as: [cyan]{userName}[/]");
-            if (!orchestrator!.HasValidUserId)
+            if (!orchestrator!.HasValidUser)
             {
-                AnsiConsole.MarkupLine("[yellow]⚠ Warning: Could not retrieve your user ID. Showing all pending approvals instead of filtering by assignment.[/]");
+                AnsiConsole.MarkupLine("[yellow]⚠ Warning: Could not retrieve your user info. Showing all pending approvals instead of filtering by assignment.[/]");
             }
             AnsiConsole.WriteLine();
         }
