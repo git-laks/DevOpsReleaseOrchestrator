@@ -237,6 +237,8 @@ public class DevOpsOrchestrator
     private readonly string _baseUrl;
     private string _currentUserId = string.Empty;
 
+    public bool HasValidUserId => !string.IsNullOrEmpty(_currentUserId);
+
     public DevOpsOrchestrator(HttpClient httpClient, AppSettings settings)
     {
         _httpClient = httpClient;
@@ -246,10 +248,44 @@ public class DevOpsOrchestrator
 
     public async Task<string> GetCurrentUserIdAsync()
     {
-        var url = $"{_settings.OrganizationUrl.TrimEnd('/')}/_apis/connectionData?api-version=7.1";
-        var response = await _httpClient.GetFromJsonAsync<ConnectionDataResponse>(url);
-        _currentUserId = response?.AuthenticatedUser?.Id ?? string.Empty;
-        return response?.AuthenticatedUser?.DisplayName ?? "Unknown User";
+        try
+        {
+            // Use the VSSPS profile API which works reliably with Azure AD tokens
+            var profileUrl = "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1-preview.3";
+            var profileResponse = await _httpClient.GetAsync(profileUrl);
+
+            if (profileResponse.IsSuccessStatusCode)
+            {
+                var profileJson = await profileResponse.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(profileJson);
+
+                if (doc.RootElement.TryGetProperty("id", out var idProp))
+                {
+                    _currentUserId = idProp.GetString() ?? string.Empty;
+                }
+
+                if (doc.RootElement.TryGetProperty("displayName", out var nameProp))
+                {
+                    return nameProp.GetString() ?? "Unknown User";
+                }
+            }
+
+            // Fallback to connectionData API if profile API fails
+            var url = $"{_settings.OrganizationUrl.TrimEnd('/')}/_apis/connectionData?api-version=7.1";
+            var response = await _httpClient.GetFromJsonAsync<ConnectionDataResponse>(url);
+            _currentUserId = response?.AuthenticatedUser?.Id ?? string.Empty;
+            return response?.AuthenticatedUser?.DisplayName ?? "Unknown User";
+        }
+        catch (HttpRequestException ex)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning: Could not fetch user info: {ex.Message}[/]");
+            return "Unknown User";
+        }
+        catch (JsonException ex)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning: Could not parse user info: {ex.Message}[/]");
+            return "Unknown User";
+        }
     }
 
     public async Task<List<ApprovalDisplayItem>> GetPendingApprovalsForStageAsync(string stageName)
@@ -266,9 +302,19 @@ public class DevOpsOrchestrator
             foreach (var approval in response.Value)
             {
                 // Check if current user is assigned to this approval
-                var isAssigned = approval.Steps?.Any(s =>
-                    s.Status.Equals("pending", StringComparison.OrdinalIgnoreCase) &&
-                    s.AssignedApprover?.Id == _currentUserId) ?? false;
+                // If _currentUserId is empty (API failed), show all pending approvals with a warning
+                bool isAssigned;
+                if (string.IsNullOrEmpty(_currentUserId))
+                {
+                    isAssigned = approval.Steps?.Any(s =>
+                        s.Status.Equals("pending", StringComparison.OrdinalIgnoreCase)) ?? false;
+                }
+                else
+                {
+                    isAssigned = approval.Steps?.Any(s =>
+                        s.Status.Equals("pending", StringComparison.OrdinalIgnoreCase) &&
+                        s.AssignedApprover?.Id == _currentUserId) ?? false;
+                }
 
                 if (!isAssigned) continue;
 
@@ -534,6 +580,10 @@ public static class Program
                 });
 
             AnsiConsole.MarkupLine($"[green]✓[/] Authenticated as: [cyan]{userName}[/]");
+            if (!orchestrator!.HasValidUserId)
+            {
+                AnsiConsole.MarkupLine("[yellow]⚠ Warning: Could not retrieve your user ID. Showing all pending approvals instead of filtering by assignment.[/]");
+            }
             AnsiConsole.WriteLine();
         }
         catch (Exception ex)
