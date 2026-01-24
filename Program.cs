@@ -15,8 +15,14 @@ public class AppSettings
 {
     public string OrganizationUrl { get; set; } = string.Empty;
     public string ProjectName { get; set; } = string.Empty;
-    public List<string> SelectableStages { get; set; } = [];
+    public List<StageConfig> Stages { get; set; } = [];
     public List<CancellationRule> CancellationRules { get; set; } = [];
+}
+
+public class StageConfig
+{
+    public string Name { get; set; } = string.Empty;
+    public string Instructions { get; set; } = string.Empty;
 }
 
 public class CancellationRule
@@ -51,6 +57,9 @@ public class Approval
 
     [JsonPropertyName("createdOn")]
     public DateTime CreatedOn { get; set; }
+
+    [JsonPropertyName("instructions")]
+    public string? Instructions { get; set; }
 
     [JsonPropertyName("pipeline")]
     public PipelineReference? Pipeline { get; set; }
@@ -304,7 +313,7 @@ public class DevOpsOrchestrator
         return atIndex > 0 ? email[..atIndex] : email;
     }
 
-    public async Task<List<ApprovalDisplayItem>> GetPendingApprovalsForStageAsync(string stageName)
+    public async Task<List<ApprovalDisplayItem>> GetPendingApprovalsForStageAsync(StageConfig stage)
     {
         var results = new List<ApprovalDisplayItem>();
 
@@ -314,12 +323,6 @@ public class DevOpsOrchestrator
             var response = await _httpClient.GetFromJsonAsync<ApprovalsResponse>(url);
 
             if (response?.Value == null) return results;
-
-            // DEBUG: Log the raw response to understand the structure
-            var rawJson = await _httpClient.GetStringAsync(url);
-            AnsiConsole.MarkupLine($"[grey]DEBUG: Raw API Response:[/]");
-            AnsiConsole.MarkupLine($"[grey]{rawJson[..Math.Min(2000, rawJson.Length)]}[/]");
-            AnsiConsole.WriteLine();
 
             foreach (var approval in response.Value)
             {
@@ -341,9 +344,9 @@ public class DevOpsOrchestrator
 
                 if (!isAssigned) continue;
 
-                // Check if this approval is for the selected stage
-                var resourceName = approval.Resource?.Name ?? string.Empty;
-                if (!resourceName.Contains(stageName, StringComparison.OrdinalIgnoreCase)) continue;
+                // Check if this approval matches the stage by comparing instructions
+                var approvalInstructions = approval.Instructions ?? string.Empty;
+                if (!string.Equals(approvalInstructions, stage.Instructions, StringComparison.OrdinalIgnoreCase)) continue;
 
                 // Get build info from the approval
                 var buildId = 0;
@@ -364,7 +367,7 @@ public class DevOpsOrchestrator
                     PipelineId = approval.Pipeline?.Id ?? 0,
                     BuildId = buildId,
                     BuildNumber = buildNumber,
-                    StageName = resourceName,
+                    StageName = stage.Name,
                     CreatedOn = approval.CreatedOn
                 });
             }
@@ -623,18 +626,20 @@ public static class Program
         while (true)
         {
             // Step 3: User selects a Stage
-            var selectedStage = AnsiConsole.Prompt(
+            var stageNames = settings.Stages.Select(s => s.Name).Append("Exit").ToArray();
+            var selectedStageName = AnsiConsole.Prompt(
                 new SelectionPrompt<string>()
                     .Title("[cyan]Select a stage to approve:[/]")
                     .PageSize(10)
-                    .AddChoices(settings.SelectableStages.Append("Exit").ToArray()));
+                    .AddChoices(stageNames));
 
-            if (selectedStage == "Exit")
+            if (selectedStageName == "Exit")
             {
                 AnsiConsole.MarkupLine("[grey]Goodbye![/]");
                 break;
             }
 
+            var selectedStage = settings.Stages.First(s => s.Name == selectedStageName);
             AnsiConsole.WriteLine();
 
             // Step 4: Query for pending approvals
@@ -643,7 +648,7 @@ public static class Program
 
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
-                .StartAsync($"[yellow]Searching for pending approvals in '{selectedStage}'...[/]", async ctx =>
+                .StartAsync($"[yellow]Searching for pending approvals in '{selectedStage.Name}'...[/]", async ctx =>
                 {
                     pendingApprovals = await orchestrator!.GetPendingApprovalsForStageAsync(selectedStage);
 
@@ -651,7 +656,7 @@ public static class Program
 
                     // Step 5: Dynamic Cleanup Check
                     var matchingRule = settings.CancellationRules
-                        .FirstOrDefault(r => r.TriggerStage.Equals(selectedStage, StringComparison.OrdinalIgnoreCase));
+                        .FirstOrDefault(r => r.TriggerStage.Equals(selectedStage.Name, StringComparison.OrdinalIgnoreCase));
 
                     if (matchingRule != null)
                     {
@@ -665,7 +670,7 @@ public static class Program
             // Step 6: Display summary
             if (pendingApprovals.Count == 0)
             {
-                AnsiConsole.MarkupLine($"[yellow]No pending approvals found for stage '{selectedStage}'.[/]");
+                AnsiConsole.MarkupLine($"[yellow]No pending approvals found for stage '{selectedStage.Name}'.[/]");
                 AnsiConsole.WriteLine();
                 continue;
             }
@@ -830,8 +835,16 @@ public static class Program
             if (string.IsNullOrWhiteSpace(settings.ProjectName))
                 errors.Add("ProjectName is required");
 
-            if (settings.SelectableStages.Count == 0)
-                errors.Add("SelectableStages must contain at least one stage");
+            if (settings.Stages.Count == 0)
+                errors.Add("Stages must contain at least one stage");
+
+            foreach (var stage in settings.Stages)
+            {
+                if (string.IsNullOrWhiteSpace(stage.Name))
+                    errors.Add("Stage.Name cannot be empty");
+                if (string.IsNullOrWhiteSpace(stage.Instructions))
+                    errors.Add($"Stage.Instructions cannot be empty for stage '{stage.Name}'");
+            }
 
             foreach (var rule in settings.CancellationRules)
             {
@@ -870,7 +883,7 @@ public static class Program
 
         configTable.AddRow("Organization", settings.OrganizationUrl);
         configTable.AddRow("Project", settings.ProjectName);
-        configTable.AddRow("Selectable Stages", string.Join(", ", settings.SelectableStages));
+        configTable.AddRow("Stages", string.Join(", ", settings.Stages.Select(s => s.Name)));
         configTable.AddRow("Cancellation Rules", settings.CancellationRules.Count.ToString());
 
         AnsiConsole.Write(configTable);
